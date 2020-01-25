@@ -5,29 +5,64 @@ import base64
 import binascii
 import json
 import random
+import asyncio
 
 import voluptuous as vol
 
+from homeassistant.const import CONF_NAME, CONF_HOST, CONF_TOKEN, ATTR_ENTITY_ID
 import homeassistant.helpers.config_validation as cv
-from homeassistant.components.fan import (FanEntity, PLATFORM_SCHEMA)
 
-__version__ = '0.3.5'
+from homeassistant.components.fan import (
+    ATTR_SPEED,
+    DOMAIN,
+    PLATFORM_SCHEMA,
+    SPEED_OFF,
+    SUPPORT_SET_SPEED,
+    FanEntity
+)
+
+__version__ = '0.4.0'
 
 G = int('A4D1CBD5C3FD34126765A442EFB99905F8104DD258AC507FD6406CFF14266D31266FEA1E5C41564B777E690F5504F213160217B4B01B886A5E91547F9E2749F4D7FBD7D3B9A92EE1909D0D2263F80A76A6A24C087A091F531DBF0A0169B6A28AD662A4D18E73AFA32D779D5918D08BC8858F4DCEF97C2A24855E6EEB22B3B2E5', 16)
 P = int('B10B8F96A080E01DDE92DE5EAE5D54EC52C99FBCFB06A3C69A6A9DCA52D23B616073E28675A23D189838EF1E2EE652C013ECB4AEA906112324975C3CD49B83BFACCBDD7D90C4BD7098488E9C219A73724EFFD6FAE5644738FAA31A4FF55BCCC0A151AF5F0DC8B4BD45BF37DF365C1A65E68CFDA76D4DA708DF1FB2BC2E4A4371', 16)
 
+DATA_KEY = "fan.philips_airpurifier"
+
 CONF_HOST = 'host'
 CONF_NAME = 'name'
+
+FEATURE_SET_CHILD_LOCK = 4
+FEATURE_SET_LED_BRIGHTNESS = 8
+
+FEATURE_FLAGS_FAN = (
+    FEATURE_SET_CHILD_LOCK
+    | FEATURE_SET_LED_BRIGHTNESS
+)
+
+ATTR_BRIGHTNESS = "brightness"
+ATTR_BUTTON_LIGHT = "button_light"
+
+SERVICE_SET_LED_BRIGHTNESS = "philips_airpurifier_set_led_brightness"
+SERVICE_SET_BUTTON_LIGHT = "philips_airpurifier_set_button_light"
 
 DEFAULT_NAME = 'Philips AirPurifier'
 ICON = 'mdi:air-purifier'
 
-SPEED_LIST = ['Auto Mode', 'Allergen Mode', 'Sleep Mode', 'Speed 1', 'Speed 2', 'Speed 3', 'Turbo']
+SPEED_LIST = ['Auto Mode', 'Allergen Mode', 'Bacteria Mode', 'Sleep Mode', 'Speed 1', 'Speed 2', 'Speed 3', 'Turbo']
+
+AIRPURIFIER_SERVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_ENTITY_ID): cv.entity_ids})
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_HOST): cv.string,
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
 })
+
+SERVICE_SCHEMA_LED_BRIGHTNESS = AIRPURIFIER_SERVICE_SCHEMA.extend(
+    {vol.Required(ATTR_BRIGHTNESS): vol.All(vol.Coerce(int), vol.Clamp(min=0, max=100))}
+)
+SERVICE_SCHEMA_BUTTON_LIGHT = AIRPURIFIER_SERVICE_SCHEMA.extend(
+    {vol.Required(ATTR_BUTTON_LIGHT): cv.string,}
+)
 
 ### Encrypting and Decrypting for Philips ###
 
@@ -52,8 +87,28 @@ def decrypt(data, key):
 
 ### Setup Platform ###
 
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    add_devices([PhilipsAirPurifierFan(hass, config)])
+async def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
+    device = PhilipsAirPurifierFan(hass, config)
+    
+    async_add_devices([device])
+    
+    async def async_led_brightness_handler(service):
+        brightness = service.data.get(ATTR_BRIGHTNESS, 100)
+        await device.async_set_led_brightness(brightness)
+        device.async_schedule_update_ha_state(True)
+
+    async def async_button_light_handler(service):
+        button_light = service.data.get(ATTR_BUTTON_LIGHT, '1')
+        await device.async_set_button_light(button_light)
+        device.async_schedule_update_ha_state(True)
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_LED_BRIGHTNESS, async_led_brightness_handler, schema=SERVICE_SCHEMA_LED_BRIGHTNESS
+    )
+    
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_BUTTON_LIGHT, async_button_light_handler, schema=SERVICE_SCHEMA_BUTTON_LIGHT
+    )
 
 class PhilipsAirPurifierFan(FanEntity):
     def __init__(self, hass, config):
@@ -63,6 +118,9 @@ class PhilipsAirPurifierFan(FanEntity):
         self._state = None
         self._session_key = None
         
+        self._device_features = FEATURE_FLAGS_FAN
+        
+        self._mode = None
         self._fan_speed = None
         
         self._pre_filter = None
@@ -80,6 +138,7 @@ class PhilipsAirPurifierFan(FanEntity):
         self._used_index = None
         self._water_level = None
         self._child_lock = None
+        self._button_light = None
         
         self.update()
     
@@ -118,12 +177,13 @@ class PhilipsAirPurifierFan(FanEntity):
         if 'mode' in status:
             mode = status['mode']
             mode_str = {'P': 'Auto Mode', 'A': 'Allergen Mode', 'S': 'Sleep Mode', 'M': 'Manual', 'B': 'Bacteria', 'N': 'Night'}
+            self._mode = mode_str.get(mode, mode)
             self._fan_speed = mode_str.get(mode, mode)
         if 'om' in status:
             om = status['om']
             om_str = {'s': 'Silent', 't': 'Turbo', '1': 'Speed 1', '2': 'Speed 2', '3': 'Speed 3'}
             om = om_str.get(om, om)
-            if om != 'Silent' and self._fan_speed == 'Manual':
+            if self._fan_speed == 'Manual':
                 self._fan_speed = om
         if 'aqil' in status:
             self._light_brightness = status['aqil']
@@ -135,8 +195,17 @@ class PhilipsAirPurifierFan(FanEntity):
             self._water_level = status['wl']
         if 'cl' in status:
             self._child_lock = status['cl']
+        if 'uil' in status:
+            uil = status['uil']
+            uil_str = {'1': 'On', '0': 'Off'}
+            self._button_light = uil_str.get(uil, uil)
     
     ### Properties ###
+    
+    @property
+    def supported_features(self):
+        """Flag supported features."""
+        return SUPPORT_SET_SPEED
     
     @property
     def state(self):
@@ -157,6 +226,14 @@ class PhilipsAirPurifierFan(FanEntity):
     @property
     def speed(self) -> str:
         return self._fan_speed
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+        
+    @property
+    def light_brightness(self) -> int:
+        return self._light_brightness
     
     def turn_on(self, speed: str = None, **kwargs) -> None:
         if speed is None:
@@ -171,22 +248,44 @@ class PhilipsAirPurifierFan(FanEntity):
         values['pwr'] = '0'
         self.set_values(values)
     
-    def set_speed(self, speed: str):
+    def set_speed(self, speed: str) -> None:
         values = {}
         if speed == 'Turbo':
+            values['mode'] = 'M'
             values['om'] = 't'
         elif speed == 'Speed 1':
+            values['mode'] = 'M'
             values['om'] = '1'
         elif speed == 'Speed 2':
+            values['mode'] = 'M'
             values['om'] = '2'
         elif speed == 'Speed 3':
+            values['mode'] = 'M'
             values['om'] = '3'
+        elif speed == 'P':
+            values['mode'] = 'P'
         elif speed == 'Auto Mode':
             values['mode'] = 'P'
         elif speed == 'Allergen Mode':
             values['mode'] = 'A'
+        elif speed == 'Bacteria Mode':
+            values['mode'] = 'B'
         elif speed == 'Sleep Mode':
-            values['mode'] = 'S'
+            values['mode'] = 'M'
+            values['om'] = 's'
+        self.set_values(values)
+        
+    async def async_set_speed(self, speed: str):
+        self.set_speed(self, speed)
+
+    async def async_set_led_brightness(self, brightness: int = 100):
+        values = {}
+        values['aqil'] = brightness
+        self.set_values(values)
+
+    async def async_set_button_light(self, button_light):
+        values = {}
+        values['uil'] = button_light
         self.set_values(values)
     
     @property
@@ -220,6 +319,10 @@ class PhilipsAirPurifierFan(FanEntity):
           attr['carbon_filter'] = self._carbon_filter
         if self._hepa_filter != None:
           attr['hepa_filter'] = self._hepa_filter
+        if self._mode != None:
+          attr['mode'] = self._mode
+        if self._button_light != None:
+          attr['button_light'] = self._button_light
         return attr
     
     ### Other methods ###
